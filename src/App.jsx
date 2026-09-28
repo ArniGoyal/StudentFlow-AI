@@ -3,7 +3,7 @@ import {
   History, Bell, Send, Mic, MicOff,
   ChevronRight, Activity, Calendar, Clock, CheckCircle2, 
   AlertCircle, BookOpen, Wind, Coffee,
-  X, Check
+  X, Check, ShieldAlert
 } from 'lucide-react';
 import { CURRENT_STUDENT, PAST_SESSIONS, DEPARTMENTS, SELF_HELP_RESOURCES, getCounsellorsForDept, generateAvailability } from './data';
 
@@ -14,9 +14,10 @@ const getIcon = (iconName) => {
 };
 
 export default function App() {
-  const [chatState, setChatState] = useState('initial'); 
-  // 'initial' | 'processing' | 'approval' | 'scheduling' | 'scheduled'
+  const isCounsellorView = window.location.pathname === '/staff';
   
+  // -- STUDENT STATE --
+  const [chatState, setChatState] = useState('initial'); 
   const [messages, setMessages] = useState([
     {
       sender: 'ai',
@@ -30,7 +31,13 @@ export default function App() {
   const [scheduleData, setScheduleData] = useState({}); 
   const [priorities, setPriorities] = useState({}); // { deptName: [slot1, slot2, slot3] }
   const [showHistoryModal, setShowHistoryModal] = useState(null);
+  const [activeRequestId, setActiveRequestId] = useState(null);
+  const [requestStatus, setRequestStatus] = useState(null); // 'pending' | 'matched' | 'fixed'
+  const [serverRequestData, setServerRequestData] = useState(null); 
   
+  // -- COUNSELLOR STATE --
+  const [allRequests, setAllRequests] = useState([]);
+
   const chatEndRef = useRef(null);
 
   const scrollToBottom = () => {
@@ -38,8 +45,61 @@ export default function App() {
   };
 
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, chatState, aiAnalysis, selectedDepts]);
+    if(!isCounsellorView) scrollToBottom();
+  }, [messages, chatState, aiAnalysis, selectedDepts, isCounsellorView]);
+
+  // Polling for Student Request Status
+  useEffect(() => {
+    let interval;
+    if (!isCounsellorView && activeRequestId && (requestStatus === 'pending' || requestStatus === 'matched')) {
+      interval = setInterval(async () => {
+        try {
+          const res = await fetch(`http://localhost:5001/api/requests/${activeRequestId}`);
+          const data = await res.json();
+          if (data && data.status) {
+            setRequestStatus(data.status);
+            setServerRequestData(data);
+          }
+        } catch (err) {
+          console.error("Polling error", err);
+        }
+      }, 3000);
+    }
+    return () => clearInterval(interval);
+  }, [isCounsellorView, activeRequestId, requestStatus]);
+
+  // Fetching Counsellor Requests
+  useEffect(() => {
+    if (isCounsellorView) {
+      fetchCounsellorRequests();
+      // Auto refresh staff page to see incoming requests dynamically
+      const staffInterval = setInterval(fetchCounsellorRequests, 5000);
+      return () => clearInterval(staffInterval);
+    }
+  }, [isCounsellorView]);
+
+  const fetchCounsellorRequests = async () => {
+    try {
+      const res = await fetch('http://localhost:5001/api/counsellor/requests');
+      const data = await res.json();
+      setAllRequests(data.filter(r => r.status !== 'fixed'));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleCounsellorDecision = async (reqId, dept, slotId, decision) => {
+    try {
+      await fetch(`http://localhost:5001/api/counsellor/requests/${reqId}/decide`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dept, slotId, decision })
+      });
+      fetchCounsellorRequests();
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const handleVoiceNote = () => {
     setIsRecording(true);
@@ -63,7 +123,6 @@ export default function App() {
       setChatState('approval');
     } catch (err) {
       console.error(err);
-      // Fallback if backend fails
       setAiAnalysis({
         departments: ["Counselling & Wellbeing", "Academic Support"],
         summary: "Student is experiencing academic stress and needs wellbeing support.",
@@ -96,7 +155,6 @@ export default function App() {
   const handleApproveDepts = () => {
     if(selectedDepts.length === 0) return;
     
-    // Prepare calendar data
     const schedule = {};
     selectedDepts.forEach(dept => {
       const counsellors = getCounsellorsForDept(dept);
@@ -126,23 +184,125 @@ export default function App() {
     }
   };
 
-  const submitFinalRequest = () => {
-    // Validate if at least one slot selected for each dept
+  const submitFinalRequest = async () => {
     const isValid = selectedDepts.every(dept => priorities[dept] && priorities[dept].length > 0);
     if(!isValid) {
       alert("Please select at least 1 time slot for each requested department.");
       return;
     }
     
-    setChatState('scheduled');
-    setMessages(prev => [...prev, 
-      { sender: 'ai', text: "Your request (Case #SF-1043) has been officially submitted and an appointment has been fixed. I've gathered some targeted self-help resources for you in the right panel." }
-    ]);
+    try {
+      const res = await fetch('http://localhost:5001/api/requests', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          student: CURRENT_STUDENT,
+          departments: selectedDepts,
+          priorities: priorities
+        })
+      });
+      const data = await res.json();
+      setActiveRequestId(data.id);
+      setRequestStatus(data.status);
+      setServerRequestData(data);
+      
+      setChatState('scheduled');
+      setMessages(prev => [...prev, 
+        { sender: 'ai', text: `Your request (${data.id}) has been submitted! It is currently pending counsellor approval. I will notify you once a slot is confirmed.` }
+      ]);
+    } catch (e) {
+      console.error(e);
+      alert("Failed to submit request.");
+    }
   };
+
+  // --- RENDERING ---
+
+  if (isCounsellorView) {
+    return (
+      <div className="min-h-screen bg-slate-100 flex flex-col font-sans">
+        <header className="bg-navy-900 text-white border-b border-navy-800 sticky top-0 z-50">
+          <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <ShieldAlert className="w-5 h-5 text-brand-400" />
+              <span className="font-bold text-xl tracking-tight">Counsellor Portal</span>
+            </div>
+            <a href="/" className="text-sm bg-navy-800 px-4 py-2 rounded-lg hover:bg-navy-700 transition">
+              Return to Student View
+            </a>
+          </div>
+        </header>
+
+        <main className="flex-grow p-6 max-w-5xl mx-auto w-full">
+          <h2 className="text-2xl font-bold text-navy-900 mb-6">Pending Student Requests</h2>
+          
+          {allRequests.length === 0 ? (
+            <div className="bg-white p-8 rounded-xl shadow-sm text-center border border-slate-200">
+              <p className="text-slate-500">No pending requests.</p>
+            </div>
+          ) : (
+            <div className="space-y-6">
+              {allRequests.map(req => (
+                <div key={req.id} className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                  <div className="bg-slate-50 px-5 py-4 border-b border-slate-200 flex justify-between items-center">
+                    <div>
+                      <h3 className="font-bold text-navy-900">{req.student.name} ({req.student.id})</h3>
+                      <p className="text-xs text-slate-500">Case ID: {req.id} • Status: {req.status.toUpperCase()}</p>
+                    </div>
+                  </div>
+                  <div className="p-5 space-y-6">
+                    {req.departments.map(dept => {
+                      const deptSlots = req.priorities[dept] || [];
+                      // Find first pending or accepted
+                      const activeSlot = deptSlots.find(s => s.status === 'pending' || s.status === 'accepted');
+                      const isDeptFixed = deptSlots.some(s => s.status === 'accepted');
+                      
+                      return (
+                        <div key={dept} className="border border-slate-200 rounded-lg overflow-hidden">
+                          <div className="bg-brand-50 px-4 py-2 border-b border-brand-100 flex justify-between">
+                            <span className="font-semibold text-brand-900 text-sm">{dept}</span>
+                            {isDeptFixed && <span className="text-xs font-bold text-green-600">CONFIRMED</span>}
+                          </div>
+                          <div className="p-4">
+                            {isDeptFixed ? (
+                              <p className="text-sm text-green-700">Appointment fixed for this department.</p>
+                            ) : (
+                              deptSlots.map((slot, index) => (
+                                <div key={slot.slotId} className={`flex justify-between items-center p-3 mb-2 rounded border ${slot.status === 'rejected' ? 'bg-red-50 border-red-100 opacity-60' : 'bg-slate-50 border-slate-200'}`}>
+                                  <div>
+                                    <span className="text-xs font-bold text-slate-500 mr-2">Priority {index + 1}</span>
+                                    <span className={`text-sm ${slot.status === 'rejected' ? 'line-through text-red-800' : 'font-medium text-navy-900'}`}>
+                                      {slot.slotData.day}, {slot.slotData.time} — {slot.counsellorName}
+                                    </span>
+                                  </div>
+                                  {slot.status === 'pending' && activeSlot?.slotId === slot.slotId && (
+                                    <div className="flex gap-2">
+                                      <button onClick={() => handleCounsellorDecision(req.id, dept, slot.slotId, 'accepted')} className="bg-green-600 text-white text-xs px-3 py-1.5 rounded hover:bg-green-700">Accept</button>
+                                      <button onClick={() => handleCounsellorDecision(req.id, dept, slot.slotId, 'rejected')} className="bg-red-100 text-red-700 text-xs px-3 py-1.5 rounded hover:bg-red-200">Reject</button>
+                                    </div>
+                                  )}
+                                  {slot.status === 'rejected' && <span className="text-xs text-red-600 font-bold">REJECTED</span>}
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </main>
+      </div>
+    );
+  }
+
+  // --- STUDENT VIEW ---
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col font-sans">
-      {/* Header */}
       <header className="bg-white border-b border-navy-100 sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
           <div className="flex items-center gap-6">
@@ -155,9 +315,11 @@ export default function App() {
           </div>
           
           <div className="flex items-center gap-4">
+            <a href="/staff" target="_blank" rel="noopener noreferrer" className="text-xs font-medium bg-brand-50 text-brand-700 px-3 py-1.5 rounded-lg hover:bg-brand-100 border border-brand-200 mr-2">
+              Staff Portal Login
+            </a>
             <button className="text-navy-400 hover:text-navy-600 relative">
               <Bell className="w-5 h-5" />
-              <span className="absolute top-0 right-0 w-2 h-2 bg-brand-500 rounded-full border border-white"></span>
             </button>
             <div className="flex items-center gap-3 pl-4 border-l border-navy-100">
               <div className="text-right hidden sm:block">
@@ -170,7 +332,6 @@ export default function App() {
         </div>
       </header>
 
-      {/* Hero */}
       <div className="bg-navy-900 text-white py-6 px-4">
         <div className="max-w-7xl mx-auto">
           <h1 className="text-2xl md:text-3xl font-bold mb-2">One conversation. The right support.</h1>
@@ -179,9 +340,7 @@ export default function App() {
 
       <main className="flex-grow p-4 max-w-7xl mx-auto w-full grid grid-cols-1 lg:grid-cols-12 gap-6 -mt-4">
         
-        {/* Left Column: AI Support & Progress */}
         <div className="lg:col-span-8 flex flex-col gap-6">
-          
           <div className="bg-white rounded-xl shadow-sm border border-navy-100 overflow-hidden flex flex-col min-h-[500px]">
             <div className="p-4 border-b border-navy-50 bg-white flex justify-between items-center">
               <div className="flex items-center gap-3">
@@ -212,7 +371,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* State: Approval & Edit Departments */}
               {chatState === 'approval' && aiAnalysis && (
                 <div className="flex justify-start animate-slide-up">
                   <div className="bg-white border border-brand-200 rounded-2xl rounded-bl-none shadow-sm w-full max-w-lg overflow-hidden">
@@ -255,7 +413,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* State: Multi-Department Calendar Scheduling */}
               {chatState === 'scheduling' && (
                 <div className="flex justify-start animate-slide-up">
                   <div className="bg-white border border-navy-200 rounded-2xl rounded-bl-none shadow-sm w-full max-w-lg overflow-hidden">
@@ -339,16 +496,20 @@ export default function App() {
             </div>
           </div>
 
-          {/* Progress Tracker (Hardcoded to Fixed state) */}
           {chatState === 'scheduled' && (
             <div className="bg-white rounded-xl shadow-sm border border-navy-100 p-5 animate-slide-up">
               <div className="flex justify-between items-center mb-6">
                 <h3 className="font-bold text-navy-900">Application Tracker</h3>
-                <span className="text-xs font-medium bg-navy-100 text-navy-700 px-2 py-1 rounded">Case #SF-1043</span>
+                <span className="text-xs font-medium bg-navy-100 text-navy-700 px-2 py-1 rounded">Case #{activeRequestId}</span>
               </div>
               
               <div className="relative">
-                <div className="absolute top-1/2 left-0 w-full h-1 bg-brand-500 -translate-y-1/2 rounded z-0 hidden md:block"></div>
+                <div className="absolute top-1/2 left-0 w-full h-1 bg-navy-100 -translate-y-1/2 rounded z-0 hidden md:block"></div>
+                
+                {/* Dynamic Progress Bar Width */}
+                <div className="absolute top-1/2 left-0 h-1 bg-brand-500 -translate-y-1/2 rounded z-0 transition-all duration-1000 hidden md:block" 
+                  style={{ width: requestStatus === 'pending' ? '50%' : requestStatus === 'matched' ? '75%' : '100%' }}>
+                </div>
                 
                 <div className="flex flex-col md:flex-row justify-between relative z-10 gap-4 md:gap-0">
                   <div className="flex md:flex-col items-center gap-3 md:gap-2 text-left md:text-center">
@@ -360,11 +521,18 @@ export default function App() {
                     <div><p className="text-sm font-semibold text-navy-900">AI Triage Complete</p></div>
                   </div>
                   <div className="flex md:flex-col items-center gap-3 md:gap-2 text-left md:text-center">
-                    <div className="w-8 h-8 rounded-full bg-brand-600 text-white flex items-center justify-center flex-shrink-0"><CheckCircle2 className="w-5 h-5" /></div>
-                    <div><p className="text-sm font-semibold text-navy-900">Matched</p></div>
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 transition-all duration-500 ${requestStatus === 'fixed' || requestStatus === 'matched' ? 'bg-brand-600 text-white' : 'bg-white border-2 border-brand-600'}`}>
+                      {requestStatus === 'fixed' || requestStatus === 'matched' ? <CheckCircle2 className="w-5 h-5" /> : <div className="w-2.5 h-2.5 bg-brand-600 rounded-full animate-pulse"></div>}
+                    </div>
+                    <div>
+                      <p className="text-sm font-semibold text-navy-900">Routing to Counsellor</p>
+                      {requestStatus === 'pending' && <p className="text-xs text-navy-500 animate-pulse">Pending response</p>}
+                    </div>
                   </div>
                   <div className="flex md:flex-col items-center gap-3 md:gap-2 text-left md:text-center">
-                    <div className="w-8 h-8 rounded-full bg-brand-600 text-white flex items-center justify-center flex-shrink-0"><CheckCircle2 className="w-5 h-5" /></div>
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 transition-all duration-500 ${requestStatus === 'fixed' ? 'bg-brand-600 text-white' : 'bg-white border-2 border-navy-200 text-navy-300'}`}>
+                      {requestStatus === 'fixed' ? <CheckCircle2 className="w-5 h-5" /> : <Clock className="w-4 h-4" />}
+                    </div>
                     <div><p className="text-sm font-semibold text-navy-900">Appointment Fixed</p></div>
                   </div>
                 </div>
@@ -372,7 +540,6 @@ export default function App() {
             </div>
           )}
 
-          {/* Previous Sessions (History) */}
           <div className="bg-white rounded-xl shadow-sm border border-navy-100 overflow-hidden">
             <div className="p-5 border-b border-navy-50 flex items-center gap-2">
               <History className="w-5 h-5 text-navy-500" />
@@ -397,9 +564,7 @@ export default function App() {
 
         </div>
 
-        {/* Right Column: Self Help & Upcoming Appointments */}
         <div className="lg:col-span-4 flex flex-col gap-6">
-          
           <div className="bg-white rounded-xl shadow-sm border border-navy-100 overflow-hidden">
             <div className="p-5 bg-gradient-to-r from-navy-900 to-navy-800 text-white">
               <h3 className="font-bold text-lg mb-1">Self-Help Resources</h3>
@@ -427,27 +592,39 @@ export default function App() {
             </div>
           </div>
 
-          {/* Upcoming Calendar Widget */}
-          {chatState === 'scheduled' && (
+          {chatState === 'scheduled' && serverRequestData && (
             <div className="bg-white rounded-xl shadow-sm border border-navy-100 overflow-hidden animate-slide-up sticky top-24">
               <div className="p-5 border-b border-navy-50 flex items-center gap-2 bg-navy-50">
                 <Calendar className="w-5 h-5 text-brand-600" />
                 <h3 className="font-bold text-navy-900">Upcoming Appointments</h3>
               </div>
               <div className="p-4 space-y-4">
-                {selectedDepts.map((dept, index) => {
-                  const selectedPriority = priorities[dept]?.[0];
-                  if (!selectedPriority) return null;
-                  return (
-                    <div key={dept} className="flex gap-3 items-start border-l-2 border-brand-500 pl-3">
-                      <div className="flex-grow">
-                        <p className="text-xs font-semibold text-brand-700 uppercase">{selectedPriority.slotData.day}</p>
-                        <p className="text-sm font-bold text-navy-900 mb-1">{selectedPriority.slotData.time}</p>
-                        <p className="text-sm font-medium text-navy-800">{selectedPriority.counsellorName}</p>
-                        <p className="text-xs text-navy-500">{dept}</p>
+                {serverRequestData.departments.map(dept => {
+                  const deptSlots = serverRequestData.priorities[dept] || [];
+                  const acceptedSlot = deptSlots.find(s => s.status === 'accepted');
+                  
+                  if (acceptedSlot) {
+                    return (
+                      <div key={dept} className="flex gap-3 items-start border-l-2 border-brand-500 pl-3">
+                        <div className="flex-grow">
+                          <p className="text-xs font-semibold text-brand-700 uppercase">{acceptedSlot.slotData.day}</p>
+                          <p className="text-sm font-bold text-navy-900 mb-1">{acceptedSlot.slotData.time}</p>
+                          <p className="text-sm font-medium text-navy-800">{acceptedSlot.counsellorName}</p>
+                          <p className="text-xs text-navy-500">{dept}</p>
+                          <p className="text-xs text-green-600 font-bold mt-1">✓ CONFIRMED</p>
+                        </div>
                       </div>
-                    </div>
-                  );
+                    );
+                  } else {
+                    return (
+                      <div key={dept} className="flex gap-3 items-start border-l-2 border-slate-300 pl-3 opacity-60">
+                        <div className="flex-grow">
+                          <p className="text-sm font-medium text-navy-800">Pending Match</p>
+                          <p className="text-xs text-navy-500">{dept}</p>
+                        </div>
+                      </div>
+                    );
+                  }
                 })}
               </div>
             </div>
@@ -456,7 +633,6 @@ export default function App() {
         </div>
       </main>
 
-      {/* History Detail Modal */}
       {showHistoryModal && (
         <div className="fixed inset-0 z-[100] bg-navy-900/60 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg overflow-hidden animate-slide-up">

@@ -28,6 +28,10 @@ const DEPARTMENTS = [
   "Registrar's Office"
 ];
 
+// IN-MEMORY DATABASE
+let appointmentRequests = [];
+let nextRequestId = 1043;
+
 app.post('/api/analyze', async (req, res) => {
   try {
     if (!apiKey || apiKey === "your_gemini_api_key_here") {
@@ -35,7 +39,7 @@ app.post('/api/analyze', async (req, res) => {
     }
     const { text } = req.body;
     
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
     const prompt = `
     You are an intelligent triage system for a university. 
     A student has stated the following problem: "${text}"
@@ -69,42 +73,69 @@ app.post('/api/analyze', async (req, res) => {
   }
 });
 
-app.post('/api/self-help', async (req, res) => {
-  try {
-    if (!apiKey || apiKey === "your_gemini_api_key_here") {
-      return res.status(500).json({ error: "Missing Gemini API Key. Please add it to backend/.env" });
-    }
-    const { issue, departments } = req.body;
-    
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    const prompt = `
-    A university student is experiencing the following issue: "${issue}".
-    They are being routed to: ${departments.join(', ')}.
-    
-    Generate 3 highly specific, actionable, and safe self-help tips or resources they can use right now while they wait to speak to a counsellor or staff. Do NOT give medical advice.
-    
-    Return ONLY a valid JSON array of objects with the schema:
-    [
-      {
-        "title": "Tip title",
-        "type": "Resource category (e.g. Exercise, Tool, Article)",
-        "description": "Short explanation of what to do"
-      }
-    ]
-    `;
+// STUDENT ENDPOINTS
+app.post('/api/requests', (req, res) => {
+  const { student, departments, priorities } = req.body;
+  const newRequest = {
+    id: `SF-${nextRequestId++}`,
+    student,
+    departments,
+    priorities, // { deptName: [ {slotId, slotData, counsellorName, status: 'pending'|'rejected'|'accepted'} ] }
+    status: 'pending' // 'pending' | 'matched' | 'fixed'
+  };
+  
+  // Initialize slot statuses
+  for (const dept in newRequest.priorities) {
+    newRequest.priorities[dept] = newRequest.priorities[dept].map(p => ({...p, status: 'pending'}));
+  }
+  
+  appointmentRequests.push(newRequest);
+  res.json(newRequest);
+});
 
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    let jsonText = response.text().trim();
-    if (jsonText.startsWith('```json')) {
-      jsonText = jsonText.replace(/^```json/, '').replace(/```$/, '');
+app.get('/api/requests/:id', (req, res) => {
+  const request = appointmentRequests.find(r => r.id === req.params.id);
+  if (request) {
+    res.json(request);
+  } else {
+    res.status(404).json({ error: "Not found" });
+  }
+});
+
+// COUNSELLOR ENDPOINTS
+app.get('/api/counsellor/requests', (req, res) => {
+  res.json(appointmentRequests);
+});
+
+app.post('/api/counsellor/requests/:id/decide', (req, res) => {
+  const { dept, slotId, decision } = req.body; // decision: 'accepted' | 'rejected'
+  const request = appointmentRequests.find(r => r.id === req.params.id);
+  
+  if (!request) return res.status(404).json({ error: "Not found" });
+
+  const deptPriorities = request.priorities[dept];
+  const slotIndex = deptPriorities.findIndex(s => s.slotId === slotId);
+  
+  if (slotIndex > -1) {
+    deptPriorities[slotIndex].status = decision;
+    
+    // Check if any slot in any dept is accepted, or if all are rejected
+    // For simplicity, we assume if a counsellor accepts a slot, the dept is fixed.
+    // If all selected depts have at least 1 accepted slot, the whole request is 'fixed'.
+    const deptsStatus = request.departments.map(d => {
+      const slots = request.priorities[d] || [];
+      return slots.some(s => s.status === 'accepted') ? 'fixed' : 'pending';
+    });
+    
+    if (deptsStatus.every(s => s === 'fixed')) {
+      request.status = 'fixed';
+    } else {
+      request.status = 'matched'; // partially handled
     }
     
-    const parsedData = JSON.parse(jsonText);
-    res.json(parsedData);
-  } catch (error) {
-    console.error("Self Help Error:", error);
-    res.status(500).json({ error: "Failed to fetch self help" });
+    res.json(request);
+  } else {
+    res.status(400).json({ error: "Slot not found" });
   }
 });
 
